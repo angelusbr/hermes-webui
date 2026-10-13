@@ -8,6 +8,7 @@ tokens stay server-side and are persisted to the active Hermes profile's
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -62,6 +63,10 @@ _OAUTH_FLOWS_LOCK = threading.Lock()
 _OAUTH_START_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _OAUTH_START_LOCKS_LOCK = threading.Lock()
 _ANTHROPIC_ENV_KEYS = ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY")
+# The Agent's Codex refresh holds the auth lock for up to its refresh timeout
+# (20 s) + 5 s and waits that long itself; the 15 s default would fail a login
+# that finishes during a slow refresh.
+_AGENT_AUTH_LOCK_TIMEOUT_SECONDS = 25.0
 
 
 def _oauth_start_key(provider: str, hermes_home: Path) -> tuple[str, str]:
@@ -238,6 +243,44 @@ def _invalidate_provider_state_caches(provider: str) -> None:
         logger.debug("Failed to invalidate providers cache after %s credential change", provider, exc_info=True)
 
 
+def _agent_auth_store_lock(auth_path: Path):
+    """Return the Agent's cross-process auth.json lock for ``auth_path``.
+
+    The Agent refreshes Codex tokens under ``_auth_store_lock``; a WebUI
+    read-modify-write outside it can replace a refresh committed in between,
+    and refresh tokens are single-use. Without an importable Agent (or one
+    that predates the lock) persistence proceeds unlocked, as before.
+    """
+    try:
+        from hermes_cli.auth import _auth_store_lock
+    except ImportError as exc:
+        logger.warning(
+            "Agent auth store lock unavailable (%s); persisting Codex credentials "
+            "to %s without it",
+            exc,
+            auth_path,
+        )
+        return contextlib.nullcontext()
+    return _auth_store_lock(
+        timeout_seconds=_AGENT_AUTH_LOCK_TIMEOUT_SECONDS, target_path=auth_path
+    )
+
+
+def _is_webui_codex_entry(entry: Any) -> bool:
+    """True for pool entries WebUI created itself.
+
+    The Agent CLI (``hermes auth add openai-codex``) also writes
+    ``source: manual:device_code``, so the source alone does not tell whose
+    entry it is. WebUI ids have always started with ``codex-oauth-``,
+    including the older ``source: oauth_device`` entries.
+    """
+    return (
+        isinstance(entry, dict)
+        and str(entry.get("id") or "").startswith("codex-oauth-")
+        and entry.get("source") in {"manual:device_code", "oauth_device"}
+    )
+
+
 def _persist_codex_credentials(hermes_home: Path, token_data: dict[str, Any]) -> Path:
     """Persist Codex OAuth credentials to active-profile auth.json."""
     access_token = str(token_data.get("access_token") or "").strip()
@@ -246,56 +289,48 @@ def _persist_codex_credentials(hermes_home: Path, token_data: dict[str, Any]) ->
         raise RuntimeError("Codex token exchange did not return an access_token")
 
     auth_path = Path(hermes_home) / "auth.json"
-    auth = _read_auth_json(auth_path)
-    auth.setdefault("version", 1)
-    pool = auth.setdefault("credential_pool", {})
-    if not isinstance(pool, dict):
-        pool = {}
-        auth["credential_pool"] = pool
-    entries = pool.setdefault("openai-codex", [])
-    if not isinstance(entries, list):
-        entries = []
-        pool["openai-codex"] = entries
+    with _agent_auth_store_lock(auth_path):
+        auth = _read_auth_json(auth_path)
+        auth.setdefault("version", 1)
+        pool = auth.setdefault("credential_pool", {})
+        if not isinstance(pool, dict):
+            pool = {}
+            auth["credential_pool"] = pool
+        entries = pool.setdefault("openai-codex", [])
+        if not isinstance(entries, list):
+            entries = []
+            pool["openai-codex"] = entries
 
-    now = _now_iso()
-    entry = None
-    # Per Opus advisor on stage-296: also accept the legacy `source ==
-    # "oauth_device"` value so users with prior Codex OAuth credentials
-    # (written by older WebUI versions before this PR's source-key change)
-    # get their existing entry updated in-place rather than accumulating a
-    # stale duplicate pool entry.
-    _accept_sources = {"manual:device_code", "oauth_device"}
-    for candidate in entries:
-        if isinstance(candidate, dict) and candidate.get("source") in _accept_sources:
-            entry = candidate
-            break
-    if entry is None:
-        entry = {
-            "id": "codex-oauth-" + uuid.uuid4().hex[:12],
-            "label": "Codex OAuth",
-            "auth_type": "oauth",
-            "priority": 0,
-            "source": "manual:device_code",
-            "base_url": CODEX_BASE_URL,
-            "created_at": now,
-        }
-        entries.insert(0, entry)
+        now = _now_iso()
+        entry = next((candidate for candidate in entries if _is_webui_codex_entry(candidate)), None)
+        if entry is None:
+            # Accounts added with the Agent CLI stay untouched; WebUI's own
+            # credential goes after them, like a CLI add would.
+            priorities = [
+                c.get("priority") for c in entries
+                if isinstance(c, dict) and isinstance(c.get("priority"), int)
+            ]
+            entry = {
+                "id": "codex-oauth-" + uuid.uuid4().hex[:12],
+                "priority": max(priorities, default=-1) + 1,
+                "created_at": now,
+            }
+            entries.append(entry)
 
-    entry.update(
-        {
-            "label": "Codex OAuth",
-            "auth_type": "oauth",
-            "priority": 0,
-            "source": "manual:device_code",
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "base_url": CODEX_BASE_URL,
-            "last_refresh": now,
-            "updated_at": now,
-        }
-    )
-    auth["updated_at"] = now
-    path = _write_auth_json(auth, auth_path)
+        entry.update(
+            {
+                "label": "Codex OAuth",
+                "auth_type": "oauth",
+                "source": "manual:device_code",
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "base_url": CODEX_BASE_URL,
+                "last_refresh": now,
+                "updated_at": now,
+            }
+        )
+        auth["updated_at"] = now
+        path = _write_auth_json(auth, auth_path)
 
     _invalidate_provider_state_caches("openai-codex")
 

@@ -449,3 +449,150 @@ def test_late_cancel_response_does_not_re_enable_a_newer_flow(tmp_path):
     assert "CODE-TWO" in result["newFlowHtml"]
     assert "cancelled" not in result["newFlowHtml"]
     assert result["newBtnDisabled"] is True
+
+
+# ── Persistence safety once Reconnect sits in front of existing credentials ──
+
+def _install_fake_agent_auth_lock(monkeypatch):
+    """Stand-in for hermes_cli.auth._auth_store_lock: one real mutex per auth.json path."""
+    import contextlib
+    import sys
+    import threading
+    import types
+
+    locks: dict[str, threading.Lock] = {}
+    guard = threading.Lock()
+    targets: list[Path] = []
+    timeouts: list[float] = []
+
+    @contextlib.contextmanager
+    def _auth_store_lock(timeout_seconds=15.0, *, target_path=None):
+        targets.append(Path(target_path))
+        timeouts.append(timeout_seconds)
+        with guard:
+            lock = locks.setdefault(str(target_path), threading.Lock())
+        with lock:
+            yield
+
+    fake = types.ModuleType("hermes_cli.auth")
+    fake._auth_store_lock = _auth_store_lock
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake)
+    return _auth_store_lock, targets, timeouts
+
+
+def _cli_entry(entry_id: str, access: str, refresh: str, priority: int) -> dict:
+    # Shape written by `hermes auth add openai-codex` (6-hex id, same source as WebUI).
+    return {
+        "id": entry_id, "label": entry_id, "auth_type": "oauth", "priority": priority,
+        "source": "manual:device_code", "access_token": access, "refresh_token": refresh,
+        "base_url": "https://chatgpt.com/backend-api/codex",
+    }
+
+
+def test_settings_login_does_not_overwrite_a_refresh_committed_under_the_agent_lock(monkeypatch, tmp_path):
+    """The Agent refreshes a CLI account between WebUI's read and write: both survive."""
+    import threading
+
+    import api.oauth as oauth
+
+    agent_lock, targets, timeouts = _install_fake_agent_auth_lock(monkeypatch)
+    auth_path = tmp_path / "auth.json"
+    own = {"id": "codex-oauth-0123456789ab", "source": "manual:device_code", "auth_type": "oauth",
+           "priority": 0, "access_token": "OWN-OLD", "refresh_token": "OWN-OLD"}
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {"openai-codex": [own, _cli_entry("a1b2c3", "OLD-ACCESS", "OLD-REFRESH", 1)]},
+    }), encoding="utf-8")
+
+    def _agent_refresh():
+        with agent_lock(target_path=auth_path):
+            store = json.loads(auth_path.read_text(encoding="utf-8"))
+            cli = next(e for e in store["credential_pool"]["openai-codex"] if e["id"] == "a1b2c3")
+            cli.update({"access_token": "NEW-ACCESS", "refresh_token": "NEW-REFRESH"})
+            auth_path.write_text(json.dumps(store), encoding="utf-8")
+        refreshed.set()
+
+    refreshed = threading.Event()
+    refresher = threading.Thread(target=_agent_refresh, daemon=True)
+    real_read = oauth._read_auth_json
+
+    locked_at_read: list[Path] = []
+
+    def _read_then_race(path=None):
+        locked_at_read.extend(targets)
+        data = real_read(path)
+        refresher.start()
+        # Unlocked, the refresh lands before WebUI writes; locked, it waits for WebUI.
+        refreshed.wait(timeout=1)
+        return data
+
+    monkeypatch.setattr(oauth, "_read_auth_json", _read_then_race)
+    oauth._persist_codex_credentials(tmp_path, {"access_token": "WEBUI-ACCESS", "refresh_token": "WEBUI-REFRESH"})
+    refresher.join(timeout=5)
+    assert not refresher.is_alive()
+
+    entries = json.loads(auth_path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+    by_id = {e["id"]: e for e in entries}
+    assert by_id["a1b2c3"]["access_token"] == "NEW-ACCESS"
+    assert by_id["a1b2c3"]["refresh_token"] == "NEW-REFRESH"
+    assert by_id["codex-oauth-0123456789ab"]["access_token"] == "WEBUI-ACCESS"
+    assert len(entries) == 2
+    assert locked_at_read == [auth_path]  # WebUI held this profile's lock before reading
+    # Outwaits the Agent's own Codex refresh (20 s + 5 s), not the 15 s default.
+    assert timeouts[0] == 25.0  # [1] is the simulated Agent refresh
+
+
+def test_reconnect_leaves_cli_codex_accounts_alone_and_reuses_its_own_entry(monkeypatch, tmp_path):
+    import api.oauth as oauth
+
+    _install_fake_agent_auth_lock(monkeypatch)
+    auth_path = tmp_path / "auth.json"
+    native = [_cli_entry("a1b2c3", "A-ACCESS", "A-REFRESH", 0), _cli_entry("d4e5f6", "B-ACCESS", "B-REFRESH", 1)]
+    auth_path.write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": native}}), encoding="utf-8")
+
+    oauth._persist_codex_credentials(tmp_path, {"access_token": "W1", "refresh_token": "R1"})
+    entries = json.loads(auth_path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+    assert entries[:2] == native  # both CLI accounts untouched, priorities included
+    assert len(entries) == 3
+    own = entries[2]
+    assert own["id"].startswith("codex-oauth-")
+    assert own["priority"] == 2
+    assert own["access_token"] == "W1"
+
+    # A second Reconnect updates WebUI's own entry instead of adding another.
+    oauth._persist_codex_credentials(tmp_path, {"access_token": "W2", "refresh_token": "R2"})
+    entries = json.loads(auth_path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+    assert entries[:2] == native
+    assert len(entries) == 3
+    assert entries[2]["id"] == own["id"]
+    assert entries[2]["access_token"] == "W2"
+
+
+def test_reconnect_reuses_a_legacy_oauth_device_entry_from_older_webui(monkeypatch, tmp_path):
+    import api.oauth as oauth
+
+    _install_fake_agent_auth_lock(monkeypatch)
+    auth_path = tmp_path / "auth.json"
+    legacy = {"id": "codex-oauth-1a2b3c4d", "source": "oauth_device", "auth_type": "oauth",
+              "priority": 0, "access_token": "OLD", "refresh_token": "OLD"}
+    auth_path.write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": [legacy]}}), encoding="utf-8")
+
+    oauth._persist_codex_credentials(tmp_path, {"access_token": "NEW", "refresh_token": "NEW-R"})
+    entries = json.loads(auth_path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+    assert len(entries) == 1
+    assert entries[0]["id"] == "codex-oauth-1a2b3c4d"
+    assert entries[0]["source"] == "manual:device_code"
+    assert entries[0]["access_token"] == "NEW"
+
+
+def test_persist_still_works_without_an_importable_agent_lock(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    import api.oauth as oauth
+
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", types.ModuleType("hermes_cli.auth"))
+    path = oauth._persist_codex_credentials(tmp_path, {"access_token": "X", "refresh_token": "Y"})
+    entry = json.loads(path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"][0]
+    assert entry["access_token"] == "X"
+    assert entry["priority"] == 0

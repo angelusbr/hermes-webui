@@ -281,15 +281,30 @@ def _is_webui_codex_entry(entry: Any) -> bool:
     )
 
 
-def _persist_codex_credentials(hermes_home: Path, token_data: dict[str, Any]) -> Path:
-    """Persist Codex OAuth credentials to active-profile auth.json."""
+def _persist_codex_credentials(
+    hermes_home: Path, token_data: dict[str, Any], flow_id: str | None = None
+) -> Path | None:
+    """Persist Codex OAuth credentials to active-profile auth.json.
+
+    With ``flow_id``, the write happens only if that flow is still pending, and
+    the flow is marked ``success`` in the same step; returns None when a cancel
+    or expiry got there first. Lock order: the Agent auth lock first (it can
+    wait up to 25 s), ``_OAUTH_FLOWS_LOCK`` second, so cancel and poll are not
+    blocked during that wait and an accepted cancel is never overwritten.
+    """
     access_token = str(token_data.get("access_token") or "").strip()
     refresh_token = str(token_data.get("refresh_token") or "").strip()
     if not access_token:
         raise RuntimeError("Codex token exchange did not return an access_token")
 
     auth_path = Path(hermes_home) / "auth.json"
-    with _agent_auth_store_lock(auth_path):
+    with _agent_auth_store_lock(auth_path), (
+        _OAUTH_FLOWS_LOCK if flow_id else contextlib.nullcontext()
+    ):
+        if flow_id:
+            flow = _OAUTH_FLOWS.get(flow_id)
+            if not flow or flow.get("status") != "pending":
+                return None
         auth = _read_auth_json(auth_path)
         auth.setdefault("version", 1)
         pool = auth.setdefault("credential_pool", {})
@@ -331,6 +346,11 @@ def _persist_codex_credentials(hermes_home: Path, token_data: dict[str, Any]) ->
         )
         auth["updated_at"] = now
         path = _write_auth_json(auth, auth_path)
+        if flow_id:
+            # Inline: _set_flow_status would take _OAUTH_FLOWS_LOCK again.
+            flow["status"] = "success"
+            flow["updated_at"] = time.time()
+            _drop_sensitive_flow_fields(flow)
 
     _invalidate_provider_state_caches("openai-codex")
 
@@ -745,19 +765,20 @@ def _run_codex_oauth_worker(flow_id: str) -> None:
             if not authorization_code or not code_verifier:
                 raise RuntimeError("Device auth response missing authorization_code or code_verifier")
             tokens = _exchange_codex_authorization(authorization_code, code_verifier)
-            # Re-check status under lock before persisting: a cancel/expire that
-            # raced with the device-token + token-exchange network calls must
-            # win, so we don't persist credentials the user explicitly aborted.
-            with _OAUTH_FLOWS_LOCK:
-                current = _OAUTH_FLOWS.get(flow_id)
-                if not current or current.get("status") != "pending":
-                    return
-            _persist_codex_credentials(Path(live["hermes_home"]), tokens)
-            _set_flow_status(flow_id, "success")
+            # A cancel/expire that raced with the network calls, or with the wait
+            # for the Agent auth lock, must win: persist re-checks the flow and
+            # writes in one step, so aborted credentials are never saved.
+            _persist_codex_credentials(Path(live["hermes_home"]), tokens, flow_id=flow_id)
             return
         except Exception as exc:
             logger.warning("Codex OAuth onboarding flow failed: %s", exc)
-            _set_flow_status(flow_id, "error", error=str(exc))
+            with _OAUTH_FLOWS_LOCK:
+                current = _OAUTH_FLOWS.get(flow_id)
+                if current and current.get("status") == "pending":
+                    current["status"] = "error"
+                    current["updated_at"] = time.time()
+                    current["error"] = str(exc)
+                    _drop_sensitive_flow_fields(current)
             return
 
 

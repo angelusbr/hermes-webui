@@ -596,3 +596,46 @@ def test_persist_still_works_without_an_importable_agent_lock(monkeypatch, tmp_p
     entry = json.loads(path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"][0]
     assert entry["access_token"] == "X"
     assert entry["priority"] == 0
+
+
+def test_cancel_during_the_wait_for_the_agent_lock_wins(monkeypatch, tmp_path):
+    """A cancel accepted while WebUI waits for the Agent auth lock must stay
+    cancelled, and the aborted credential must not be written."""
+    import threading
+    import time as real_time
+
+    import api.oauth as oauth
+
+    agent_lock, targets, _timeouts = _install_fake_agent_auth_lock(monkeypatch)
+    auth_path = tmp_path / "auth.json"
+    cli = _cli_entry("a1b2c3", "CLI-ACCESS", "CLI-REFRESH", 0)
+    auth_path.write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": [cli]}}), encoding="utf-8")
+    oauth._OAUTH_FLOWS.clear()
+    monkeypatch.setattr(oauth, "_get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(oauth, "_request_codex_user_code", lambda: {
+        "user_code": "ABCD-1234", "device_auth_id": "device-secret", "interval": 1, "expires_in": 600,
+    })
+    monkeypatch.setattr(oauth, "_spawn_codex_oauth_worker", lambda flow_id: None)
+    monkeypatch.setattr(oauth, "_poll_codex_authorization", lambda device_auth_id, user_code: {
+        "authorization_code": "auth-code", "code_verifier": "verifier",
+    })
+    monkeypatch.setattr(oauth, "_exchange_codex_authorization", lambda code, verifier: {
+        "access_token": "ABORTED-ACCESS", "refresh_token": "ABORTED-REFRESH",
+    })
+    monkeypatch.setattr(oauth.time, "sleep", lambda _s: None)
+
+    flow_id = oauth.start_onboarding_oauth_flow({"provider": "openai-codex"})["flow_id"]
+    worker = threading.Thread(target=oauth._run_codex_oauth_worker, args=(flow_id,), daemon=True)
+    with agent_lock(target_path=auth_path):  # the Agent is mid-refresh
+        worker.start()
+        deadline = real_time.monotonic() + 5
+        while len(targets) < 2 and real_time.monotonic() < deadline:
+            real_time.sleep(0.01)
+        assert len(targets) == 2  # WebUI is now waiting for the Agent lock
+        assert oauth.cancel_onboarding_oauth_flow({"flow_id": flow_id})["status"] == "cancelled"
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "cancelled"
+    entries = json.loads(auth_path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+    assert entries == [cli]

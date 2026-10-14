@@ -802,3 +802,19 @@ def test_caches_are_cleared_for_the_profile_the_flow_started_in(monkeypatch, tmp
     assert not worker.is_alive()
     assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "success"
     assert seen == ["work"]
+
+
+def test_worker_profile_scope_restores_the_threads_previous_profile():
+    import api.oauth as oauth
+    import api.profiles as profiles
+
+    profiles.set_request_profile("outer")
+    try:
+        with oauth._worker_profile_scope("work"):
+            assert profiles._tls.profile == "work"
+        assert profiles._tls.profile == "outer"
+    finally:
+        profiles.clear_request_profile()
+    with oauth._worker_profile_scope("work"):
+        pass
+    assert getattr(profiles._tls, "profile", None) is None

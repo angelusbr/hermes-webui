@@ -61,6 +61,7 @@ globalThis.api = async (url, opts) => {
   calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
   if (url === '/api/onboarding/oauth/start') return startResponse;
   if (url.startsWith('/api/onboarding/oauth/poll')) return { status: pollStatus };
+  if (url === '/api/onboarding/oauth/cancel') return { ok: true, status: scenario.cancelStatus || 'cancelled' };
   return { ok: true };
 };
 const timers = [];
@@ -102,7 +103,11 @@ eval(src);
     result.wizardFlowTouched = wizardFlow.innerHTML !== '';
     result.btnDisabledWhilePending = btn.disabled;
     if (scenario.cancel) {
-      await cancelCodexOAuth();
+      // The server's answer to the cancel decides; a flow it did not cancel ends as pollStatus.
+      if (scenario.cancelStatus) pollStatus = scenario.pollStatus || 'success';
+      if (scenario.doubleCancel) await Promise.all([cancelCodexOAuth(), cancelCodexOAuth()]);
+      else await cancelCodexOAuth();
+      result.flowHtml = flow.innerHTML;
       result.pendingTimersAfterCancel = timers.length;
       // A poll tick already scheduled before cancel must not resume the flow.
       while (timers.length) await timers.shift()();
@@ -200,6 +205,32 @@ eval(src);
     result.newFlowHtml = b.flow.innerHTML;
   }
 
+  if (scenario.cancelDuringPoll) {
+    // A poll is in flight when Cancel is clicked; the server did not cancel
+    // (pending), so the cancel resumes polling; then the old poll answers.
+    let releaseFirstPoll = null;
+    let polls = 0;
+    globalThis.api = async (url, opts) => {
+      calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
+      if (url === '/api/onboarding/oauth/start') return startResponse;
+      if (url === '/api/onboarding/oauth/cancel') return { ok: true, status: 'pending' };
+      if (url.startsWith('/api/onboarding/oauth/poll')) {
+        polls += 1;
+        if (polls === 1) return new Promise((resolve) => { releaseFirstPoll = () => resolve({ status: 'pending' }); });
+        return { status: 'pending' };
+      }
+      return { ok: true };
+    };
+    const card = _buildProviderCard(scenario.providers.find((p) => p.id === 'openai-codex'));
+    const login = walk(card).find((el) => el.dataset.codexOauthLogin === '1');
+    await walk(login).find((el) => el.tag === 'button').listeners.click();
+    const firstPoll = timers.shift()();
+    await cancelCodexOAuth();
+    releaseFirstPoll();
+    await firstPoll;
+    result.pollLoops = timers.length;
+  }
+
   if (scenario.wizard) {
     await startCodexOAuth();
     result.wizardShowsCode = wizardFlow.innerHTML.includes('ABCD-1234');
@@ -285,7 +316,10 @@ def test_settings_login_runs_device_flow_and_refreshes_providers_not_wizard(tmp_
         "clickCodex": True,
         "providers": [_oauth_provider("openai-codex", auth_error="No Codex credentials stored.")],
     })
-    assert result["calls"][0] == {"url": "/api/onboarding/oauth/start", "body": {"provider": "openai-codex"}}
+    assert result["calls"][0] == {
+        "url": "/api/onboarding/oauth/start",
+        "body": {"provider": "openai-codex", "profile": "default"},
+    }
     assert result["calls"][1]["url"] == "/api/onboarding/oauth/poll?flow_id=f1"
     assert result["flowShowsCode"] is True
     assert result["wizardFlowTouched"] is False
@@ -313,6 +347,8 @@ def test_profile_note_is_refreshed_when_the_flow_starts(tmp_path):
     })
     assert result["cards"]["openai-codex"]["note"] == "providers_codex_profile_note:default"
     assert result["noteAtClick"] == "providers_codex_profile_note:work"
+    # The start names the profile the page shows, so the server can refuse a mismatch.
+    assert result["calls"][0]["body"] == {"provider": "openai-codex", "profile": "work"}
 
 
 def test_cancel_from_settings_cancels_server_flow_and_stops_polling(tmp_path):
@@ -332,6 +368,37 @@ def test_cancel_from_settings_cancels_server_flow_and_stops_polling(tmp_path):
     assert result["btnLabelAfter"] == "oauth_login_codex"
     assert result["providersReloads"] == 0
     assert result["wizardReloads"] == 0
+
+
+def test_a_second_cancel_click_sends_nothing(tmp_path):
+    result = _run(tmp_path, {
+        "clickCodex": True,
+        "cancel": True,
+        "doubleCancel": True,
+        "providers": [_oauth_provider("openai-codex", auth_error="No Codex credentials stored.")],
+    })
+    cancels = [c for c in result["calls"] if c["url"] == "/api/onboarding/oauth/cancel"]
+    assert cancels == [{"url": "/api/onboarding/oauth/cancel", "body": {"flow_id": "f1"}}]
+    assert result["flowShowsCancelled"] is True
+
+
+@pytest.mark.parametrize("cancel_status", ["pending", "success"])
+def test_cancel_the_server_did_not_accept_follows_the_flow_to_its_end(tmp_path, cancel_status):
+    # The credential was already saved when the cancel arrived: the server
+    # answers pending (caches still clearing) or success. The card must keep
+    # following the flow, show success and refresh, not claim "cancelled".
+    result = _run(tmp_path, {
+        "clickCodex": True,
+        "cancel": True,
+        "cancelStatus": cancel_status,
+        "providers": [_oauth_provider("openai-codex", has_key=True, key_source="oauth")],
+    })
+    assert "oauth_codex_success" in result["flowHtml"]
+    assert result["flowShowsCancelled"] is False
+    assert result["providersReloads"] == 1
+    assert result["modelRefreshes"] == 1
+    assert result["btnDisabledAfter"] is False
+    assert result["calls"][-1]["url"] == "/api/onboarding/oauth/poll?flow_id=f1"
 
 
 @pytest.mark.parametrize("status,marker", [("expired", "oauth_codex_expired"), ("error", "oauth_codex_error")])
@@ -375,6 +442,7 @@ def test_flow_started_under_one_profile_persists_there_after_a_profile_switch(mo
     home_b = tmp_path / "profile-b"
     home_a.mkdir()
     home_b.mkdir()
+    _install_fake_agent_auth_lock(monkeypatch)
     oauth._OAUTH_FLOWS.clear()
 
     active = {"home": home_a}
@@ -591,17 +659,16 @@ def test_reconnect_reuses_a_legacy_oauth_device_entry_from_older_webui(monkeypat
     assert entries[0]["access_token"] == "NEW"
 
 
-def test_persist_still_works_without_an_importable_agent_lock(monkeypatch, tmp_path):
+def test_persist_refuses_without_an_importable_agent_lock(monkeypatch, tmp_path):
     import sys
     import types
 
     import api.oauth as oauth
 
     monkeypatch.setitem(sys.modules, "hermes_cli.auth", types.ModuleType("hermes_cli.auth"))
-    path = oauth._persist_codex_credentials(tmp_path, {"access_token": "X", "refresh_token": "Y"})
-    entry = json.loads(path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"][0]
-    assert entry["access_token"] == "X"
-    assert entry["priority"] == 0
+    with pytest.raises(RuntimeError, match="Update Hermes Agent"):
+        oauth._persist_codex_credentials(tmp_path, {"access_token": "X", "refresh_token": "Y"})
+    assert not (tmp_path / "auth.json").exists()
 
 
 def test_cancel_during_the_wait_for_the_agent_lock_wins(monkeypatch, tmp_path):
@@ -733,10 +800,13 @@ def test_a_wizard_start_without_a_wizard_leaves_the_settings_flow_alone(tmp_path
     assert result["wizardReloads"] == 0
 
 
-def test_agent_lock_without_target_path_falls_back_to_unlocked(monkeypatch, tmp_path):
-    """An Agent whose lock predates target_path must not break every Codex login."""
+def test_agent_lock_without_target_path_refuses_and_says_so(monkeypatch, tmp_path):
+    """An Agent whose lock predates target_path cannot lock the profile's
+    auth.json; an unlocked write could replace a refresh committed meanwhile,
+    so the login fails with a message and the stored accounts stay as they were."""
     import contextlib
     import sys
+    import threading
     import types
 
     import api.oauth as oauth
@@ -748,8 +818,18 @@ def test_agent_lock_without_target_path_falls_back_to_unlocked(monkeypatch, tmp_
     fake = types.ModuleType("hermes_cli.auth")
     fake._auth_store_lock = _old_lock
     monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake)
-    path = oauth._persist_codex_credentials(tmp_path, {"access_token": "X", "refresh_token": "Y"})
-    assert json.loads(path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"][0]["access_token"] == "X"
+    store = {"version": 1, "credential_pool": {"openai-codex": [_cli_entry("a1b2c3", "A", "RA", 0)]}}
+    (tmp_path / "auth.json").write_text(json.dumps(store), encoding="utf-8")
+    flow_id = _start_codex_flow_with_fake_device(monkeypatch, oauth, tmp_path)
+    worker = threading.Thread(target=oauth._run_codex_oauth_worker, args=(flow_id,), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    status = oauth.poll_onboarding_oauth_flow(flow_id)
+    assert status["status"] == "error"
+    assert "Update Hermes Agent" in status["error"]
+    assert json.loads((tmp_path / "auth.json").read_text(encoding="utf-8")) == store
 
 
 def test_agent_lock_timeout_reaches_the_browser_without_paths_or_pids(monkeypatch, tmp_path):
@@ -818,3 +898,117 @@ def test_worker_profile_scope_restores_the_threads_previous_profile():
     with oauth._worker_profile_scope("work"):
         pass
     assert getattr(profiles._tls, "profile", None) is None
+
+
+def test_start_refuses_when_another_tab_switched_the_profile(monkeypatch, tmp_path):
+    """The profile cookie is shared by tabs: a card that still shows "default"
+    after another tab switched to "work" must not start a login into "work"."""
+    import api.oauth as oauth
+
+    oauth._OAUTH_FLOWS.clear()
+    requested = []
+    monkeypatch.setattr(oauth, "_get_active_profile_name", lambda: "work")
+    monkeypatch.setattr(oauth, "_get_active_hermes_home", lambda: tmp_path / "work")
+    monkeypatch.setattr(oauth, "_request_codex_user_code", lambda: requested.append(1) or {
+        "user_code": "ABCD-1234", "device_auth_id": "device-secret", "interval": 1, "expires_in": 600,
+    })
+    monkeypatch.setattr(oauth, "_spawn_codex_oauth_worker", lambda flow_id: None)
+
+    with pytest.raises(ValueError, match="profile 'default'.*profile 'work'"):
+        oauth.start_onboarding_oauth_flow({"provider": "openai-codex", "profile": "default"})
+    assert requested == []
+    assert oauth._OAUTH_FLOWS == {}
+
+    # The page that shows the request's profile starts normally, and so does a
+    # caller that names no profile (the older request shape).
+    assert oauth.start_onboarding_oauth_flow({"provider": "openai-codex", "profile": "work"})["flow_id"]
+    oauth._OAUTH_FLOWS.clear()
+    assert oauth.start_onboarding_oauth_flow({"provider": "openai-codex"})["flow_id"]
+
+
+def test_reconnect_clears_a_dead_status_so_the_entry_is_usable_again(monkeypatch, tmp_path):
+    """Fresh tokens in an entry still marked dead stay unusable: the Agent skips
+    it. Reconnect clears the failure state like ``hermes auth reset`` and stamps
+    status_cleared_at so pools already loaded in other processes drop it too.
+    CLI accounts keep their own status."""
+    import time as real_time
+
+    import api.oauth as oauth
+
+    _install_fake_agent_auth_lock(monkeypatch)
+    failed_at = real_time.time() - 60
+    own = {
+        "id": "codex-oauth-0123456789ab", "source": "manual:device_code", "auth_type": "oauth",
+        "priority": 1, "access_token": "OLD", "refresh_token": "OLD-R",
+        "last_status": "dead", "last_status_at": failed_at, "last_error_code": 401,
+        "last_error_reason": "invalidated", "last_error_message": "token revoked",
+        "last_error_reset_at": failed_at + 3600, "model_cooldowns": {"gpt-5": failed_at + 600},
+        "failure_reason": "auth",
+    }
+    cli = dict(_cli_entry("a1b2c3", "A", "RA", 0), last_status="exhausted", last_status_at=failed_at,
+               last_error_code=429, last_error_reset_at=failed_at + 3600)
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": [cli, own]}}), encoding="utf-8")
+
+    before = real_time.time()
+    oauth._persist_codex_credentials(tmp_path, {"access_token": "NEW", "refresh_token": "NEW-R"})
+    entries = json.loads(auth_path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+    assert entries[0] == cli
+    saved = entries[1]
+    assert saved["access_token"] == "NEW"
+    for field in ("last_status", "last_status_at", "last_error_code", "last_error_reason",
+                  "last_error_message", "last_error_reset_at"):
+        assert saved[field] is None, field
+    assert "model_cooldowns" not in saved
+    assert "failure_reason" not in saved
+    assert saved["status_cleared_at"] >= before > failed_at
+
+
+def test_a_poll_in_flight_during_cancel_does_not_start_a_second_loop(tmp_path):
+    result = _run(tmp_path, {
+        "cancelDuringPoll": True,
+        "providers": [_oauth_provider("openai-codex", auth_error="No Codex credentials stored.")],
+    })
+    assert result["pollLoops"] == 1
+
+
+def test_start_is_not_refused_when_the_request_profile_cannot_be_resolved(monkeypatch, tmp_path):
+    import api.oauth as oauth
+
+    oauth._OAUTH_FLOWS.clear()
+    monkeypatch.setattr(oauth, "_get_active_profile_name", lambda: None)
+    monkeypatch.setattr(oauth, "_get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(oauth, "_request_codex_user_code", lambda: {
+        "user_code": "ABCD-1234", "device_auth_id": "device-secret", "interval": 1, "expires_in": 600,
+    })
+    monkeypatch.setattr(oauth, "_spawn_codex_oauth_worker", lambda flow_id: None)
+    assert oauth.start_onboarding_oauth_flow({"provider": "openai-codex", "profile": "work"})["flow_id"]
+
+
+def test_agent_lock_os_error_reaches_the_browser_without_paths(monkeypatch, tmp_path):
+    import contextlib
+    import sys
+    import threading
+    import types
+
+    import api.oauth as oauth
+
+    @contextlib.contextmanager
+    def _denied_lock(timeout_seconds=15.0, *, target_path=None):
+        raise PermissionError(13, "Permission denied", f"{target_path}.lock")
+        yield
+
+    fake = types.ModuleType("hermes_cli.auth")
+    fake._auth_store_lock = _denied_lock
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake)
+    flow_id = _start_codex_flow_with_fake_device(monkeypatch, oauth, tmp_path)
+    worker = threading.Thread(target=oauth._run_codex_oauth_worker, args=(flow_id,), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    status = oauth.poll_onboarding_oauth_flow(flow_id)
+    assert status["status"] == "error"
+    assert "could not be locked" in status["error"]
+    assert str(tmp_path) not in status["error"]
+    assert not (tmp_path / "auth.json").exists()

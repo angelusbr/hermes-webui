@@ -175,6 +175,29 @@ def _get_active_profile_name() -> str | None:
         return None
 
 
+def _check_expected_profile(body: dict[str, Any] | None) -> None:
+    """Refuse a start whose page shows another profile than this request's.
+
+    The profile cookie is shared by every tab: after another tab switches it,
+    a card still showing the old profile would log in to the new one. The page
+    sends the profile it shows; a start without one keeps the old behaviour.
+    """
+    from api.profiles import _profiles_match
+
+    expected = str((body or {}).get("profile") or "").strip()[:64]
+    if not expected:
+        return
+    active = _get_active_profile_name()
+    if active is None:
+        # The request's profile could not be resolved; nothing to compare with.
+        return
+    if not _profiles_match(expected, active):
+        raise ValueError(
+            f"This page shows profile '{expected}', but the browser is now on profile "
+            f"'{active}' (switched in another tab). Reload the page and start the login again."
+        )
+
+
 @contextlib.contextmanager
 def _worker_profile_scope(profile: str | None):
     """Bind ``profile`` to this worker thread's request-profile slot.
@@ -301,9 +324,10 @@ def _agent_auth_store_lock(auth_path: Path):
 
     The Agent refreshes Codex tokens under ``_auth_store_lock``; a WebUI
     read-modify-write outside it can replace a refresh committed in between,
-    and refresh tokens are single-use. Without an importable Agent, or one
+    and refresh tokens are single-use. Without an importable Agent, or with one
     whose lock cannot target a profile's auth.json (``target_path``, added
-    after the lock itself), persistence proceeds unlocked, as before.
+    after the lock itself), nothing is written: an unlocked write would bring
+    that loss back, so the login fails with a message instead.
     """
     try:
         from hermes_cli.auth import _auth_store_lock
@@ -319,13 +343,14 @@ def _agent_auth_store_lock(auth_path: Path):
             reason = "this Agent's _auth_store_lock has no timeout_seconds/target_path"
     if reason:
         logger.warning(
-            "Agent auth store lock unavailable (%s); persisting Codex credentials "
-            "to %s without it",
-            reason,
+            "Codex credentials not saved to %s: Agent auth store lock unavailable (%s)",
             auth_path,
+            reason,
         )
-        yield
-        return
+        raise RuntimeError(
+            "This Hermes Agent cannot lock the saved credentials, so the login was not saved. "
+            "Update Hermes Agent and start the login again."
+        )
 
     lock = _auth_store_lock(timeout_seconds=_agent_auth_lock_timeout_seconds(), target_path=auth_path)
     with contextlib.ExitStack() as stack:
@@ -338,7 +363,24 @@ def _agent_auth_store_lock(auth_path: Path):
             raise RuntimeError(
                 "Another Hermes process is updating the saved credentials. Start the login again."
             ) from exc
+        except OSError as exc:
+            # e.g. no permission on the lock file; its path stays in the log.
+            logger.warning("Codex credentials not saved: %s", exc)
+            raise RuntimeError(
+                "The saved credentials could not be locked, so the login was not saved. Check the server logs."
+            ) from exc
         yield
+
+
+# Same fields, cleared the same way, as the Agent's ``hermes auth reset``.
+_CLEARED_POOL_STATUS = {
+    "last_status": None,
+    "last_status_at": None,
+    "last_error_code": None,
+    "last_error_reason": None,
+    "last_error_message": None,
+    "last_error_reset_at": None,
+}
 
 
 def _is_webui_codex_entry(entry: Any) -> bool:
@@ -398,7 +440,15 @@ def _persist_codex_credentials(
 
         now = _now_iso()
         entry = next((candidate for candidate in entries if _is_webui_codex_entry(candidate)), None)
-        if entry is None:
+        if entry is not None:
+            # Fresh tokens make a dead or rate-limited entry usable again; the
+            # Agent's pools only pick that up from ``status_cleared_at`` newer
+            # than the old status, the marker ``hermes auth reset`` writes.
+            entry.update(_CLEARED_POOL_STATUS)
+            entry.pop("model_cooldowns", None)
+            entry.pop("failure_reason", None)
+            entry["status_cleared_at"] = time.time()
+        else:
             # Accounts added with the Agent CLI stay untouched; WebUI's own
             # credential goes after them, like a CLI add would.
             priorities = [
@@ -940,6 +990,7 @@ def start_onboarding_oauth_flow(body: dict[str, Any] | None) -> dict[str, Any]:
         return _start_anthropic_flow(_get_active_hermes_home())
 
     # Codex flow
+    _check_expected_profile(body)
     hermes_home = _get_active_hermes_home()
     # Serialize check -> device-code request -> flow insertion -> worker spawn
     # for this provider/profile. The global flow lock is still held only for

@@ -639,3 +639,67 @@ def test_cancel_during_the_wait_for_the_agent_lock_wins(monkeypatch, tmp_path):
     assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "cancelled"
     entries = json.loads(auth_path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
     assert entries == [cli]
+
+
+def _start_codex_flow_with_fake_device(monkeypatch, oauth, tmp_path):
+    oauth._OAUTH_FLOWS.clear()
+    monkeypatch.setattr(oauth, "_get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(oauth, "_request_codex_user_code", lambda: {
+        "user_code": "ABCD-1234", "device_auth_id": "device-secret", "interval": 1, "expires_in": 600,
+    })
+    monkeypatch.setattr(oauth, "_spawn_codex_oauth_worker", lambda flow_id: None)
+    monkeypatch.setattr(oauth, "_poll_codex_authorization", lambda device_auth_id, user_code: {
+        "authorization_code": "auth-code", "code_verifier": "verifier",
+    })
+    monkeypatch.setattr(oauth, "_exchange_codex_authorization", lambda code, verifier: {
+        "access_token": "SAVED-ACCESS", "refresh_token": "SAVED-REFRESH",
+    })
+    monkeypatch.setattr(oauth.time, "sleep", lambda _s: None)
+    return oauth.start_onboarding_oauth_flow({"provider": "openai-codex"})["flow_id"]
+
+
+@pytest.mark.parametrize("intruder", ["cancel", "expiry", "restart"])
+def test_success_is_shown_only_after_the_provider_caches_are_cleared(monkeypatch, tmp_path, intruder):
+    """The browser reloads /api/providers on success, so success must not be
+    visible while the old providers response can still be cached. In that
+    window the credential is already saved: a cancel, an expiry or a new start
+    in the same profile must not move the flow away from success either."""
+    import threading
+
+    import api.oauth as oauth
+
+    _install_fake_agent_auth_lock(monkeypatch)
+    flow_id = _start_codex_flow_with_fake_device(monkeypatch, oauth, tmp_path)
+
+    clearing = threading.Event()
+    cleared = threading.Event()
+    real_invalidate = oauth._invalidate_provider_state_caches
+
+    def _slow_invalidate(provider):
+        clearing.set()
+        assert cleared.wait(timeout=5)  # e.g. waiting behind a model rebuild
+        real_invalidate(provider)
+
+    monkeypatch.setattr(oauth, "_invalidate_provider_state_caches", _slow_invalidate)
+    worker = threading.Thread(target=oauth._run_codex_oauth_worker, args=(flow_id,), daemon=True)
+    worker.start()
+    assert clearing.wait(timeout=5)
+
+    stored = json.loads((tmp_path / "auth.json").read_text(encoding="utf-8"))
+    assert stored["credential_pool"]["openai-codex"][0]["access_token"] == "SAVED-ACCESS"
+    assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "pending"
+    if intruder == "cancel":
+        oauth.cancel_onboarding_oauth_flow({"flow_id": flow_id})
+    else:
+        with oauth._OAUTH_FLOWS_LOCK:
+            oauth._OAUTH_FLOWS[flow_id]["expires_at"] = 0
+        oauth._cleanup_oauth_flows()
+        if intruder == "restart":
+            # Single-flight: the decided flow is returned, not expired and replaced.
+            assert oauth.start_onboarding_oauth_flow({"provider": "openai-codex"})["flow_id"] == flow_id
+    assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "pending"
+
+    cleared.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "success"

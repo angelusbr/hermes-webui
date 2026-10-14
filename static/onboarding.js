@@ -712,9 +712,12 @@ async function _pollCodexOAuth(seq){
 }
 
 async function startCodexOAuth(ui){
-  _codexOAuthUi=ui||null;
-  const flowDiv=_codexOAuthCurrentUi().flow();
+  // Switch surfaces only once this start goes ahead: a start whose surface is
+  // gone must not take the running flow's success away from its card.
+  const nextUi=ui||null;
+  const flowDiv=(nextUi||_codexOAuthWizardUi()).flow();
   if(!flowDiv)return;
+  _codexOAuthUi=nextUi;
   const seq=++_codexOAuthStartSeq;
   _clearCodexOAuthPoll();
   _codexOAuthFlowId=null;

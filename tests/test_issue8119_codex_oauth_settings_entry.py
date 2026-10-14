@@ -49,7 +49,8 @@ globalThis.showToast = () => {};
 globalThis.S = { activeProfile: scenario.activeProfile || 'default' };
 const wizardFlow = new El('div');
 const wizardBtn = new El('button');
-globalThis.$ = (id) => (id === 'codexOAuthFlow' ? wizardFlow : id === 'codexOAuthBtn' ? wizardBtn : null);
+let wizardMounted = true;
+globalThis.$ = (id) => (!wizardMounted ? null : id === 'codexOAuthFlow' ? wizardFlow : id === 'codexOAuthBtn' ? wizardBtn : null);
 
 const calls = [];
 let pollStatus = 'pending';
@@ -107,6 +108,11 @@ eval(src);
       while (timers.length) await timers.shift()();
       result.flowShowsCancelled = flow.innerHTML.includes('cancelled');
     } else {
+      if (scenario.strayWizardStart) {
+        // A wizard start with no wizard on the page must not take this flow's surface.
+        wizardMounted = false;
+        await startCodexOAuth();
+      }
       pollStatus = scenario.pollStatus || 'success';
       await timers.shift()();
       result.flowHtml = flow.innerHTML;
@@ -663,19 +669,29 @@ def test_success_is_shown_only_after_the_provider_caches_are_cleared(monkeypatch
     """The browser reloads /api/providers on success, so success must not be
     visible while the old providers response can still be cached. In that
     window the credential is already saved: a cancel, an expiry or a new start
-    in the same profile must not move the flow away from success either."""
+    in the same profile must not move the flow away from success either. The
+    Agent lock is already released, so the caches are cleared without it."""
     import threading
 
     import api.oauth as oauth
 
-    _install_fake_agent_auth_lock(monkeypatch)
+    agent_lock, _targets, _timeouts = _install_fake_agent_auth_lock(monkeypatch)
     flow_id = _start_codex_flow_with_fake_device(monkeypatch, oauth, tmp_path)
 
     clearing = threading.Event()
     cleared = threading.Event()
     real_invalidate = oauth._invalidate_provider_state_caches
+    agent_lock_free = []
+
+    def _probe_agent_lock():
+        with agent_lock(target_path=tmp_path / "auth.json"):
+            pass
 
     def _slow_invalidate(provider):
+        probe = threading.Thread(target=_probe_agent_lock, daemon=True)
+        probe.start()
+        probe.join(timeout=1)
+        agent_lock_free.append(not probe.is_alive())
         clearing.set()
         assert cleared.wait(timeout=5)  # e.g. waiting behind a model rebuild
         real_invalidate(provider)
@@ -695,11 +711,94 @@ def test_success_is_shown_only_after_the_provider_caches_are_cleared(monkeypatch
             oauth._OAUTH_FLOWS[flow_id]["expires_at"] = 0
         oauth._cleanup_oauth_flows()
         if intruder == "restart":
-            # Single-flight: the decided flow is returned, not expired and replaced.
-            assert oauth.start_onboarding_oauth_flow({"provider": "openai-codex"})["flow_id"] == flow_id
+            # Its code is used up: a new start gets a new flow, the saved one stays decided.
+            assert oauth.start_onboarding_oauth_flow({"provider": "openai-codex"})["flow_id"] != flow_id
     assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "pending"
 
     cleared.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
     assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "success"
+    assert agent_lock_free == [True]
+
+
+def test_a_wizard_start_without_a_wizard_leaves_the_settings_flow_alone(tmp_path):
+    result = _run(tmp_path, {
+        "clickCodex": True,
+        "strayWizardStart": True,
+        "providers": [_oauth_provider("openai-codex", auth_error="No Codex credentials stored.")],
+    })
+    assert "oauth_codex_success" in result["flowHtml"]
+    assert result["providersReloads"] == 1
+    assert result["wizardReloads"] == 0
+
+
+def test_agent_lock_without_target_path_falls_back_to_unlocked(monkeypatch, tmp_path):
+    """An Agent whose lock predates target_path must not break every Codex login."""
+    import contextlib
+    import sys
+    import types
+
+    import api.oauth as oauth
+
+    @contextlib.contextmanager
+    def _old_lock(timeout_seconds=15.0):
+        yield
+
+    fake = types.ModuleType("hermes_cli.auth")
+    fake._auth_store_lock = _old_lock
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake)
+    path = oauth._persist_codex_credentials(tmp_path, {"access_token": "X", "refresh_token": "Y"})
+    assert json.loads(path.read_text(encoding="utf-8"))["credential_pool"]["openai-codex"][0]["access_token"] == "X"
+
+
+def test_agent_lock_timeout_reaches_the_browser_without_paths_or_pids(monkeypatch, tmp_path):
+    import contextlib
+    import sys
+    import threading
+    import types
+
+    import api.oauth as oauth
+
+    @contextlib.contextmanager
+    def _busy_lock(timeout_seconds=15.0, *, target_path=None):
+        raise TimeoutError(f"Timed out waiting for auth store lock ({target_path}.lock); pid 4242 holds it")
+        yield
+
+    fake = types.ModuleType("hermes_cli.auth")
+    fake._auth_store_lock = _busy_lock
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake)
+    flow_id = _start_codex_flow_with_fake_device(monkeypatch, oauth, tmp_path)
+    worker = threading.Thread(target=oauth._run_codex_oauth_worker, args=(flow_id,), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    status = oauth.poll_onboarding_oauth_flow(flow_id)
+    assert status["status"] == "error"
+    assert "Start the login again" in status["error"]
+    assert str(tmp_path) not in status["error"]
+    assert "4242" not in status["error"]
+    assert not (tmp_path / "auth.json").exists()
+
+
+def test_caches_are_cleared_for_the_profile_the_flow_started_in(monkeypatch, tmp_path):
+    """The worker thread has no request profile; without binding the flow's
+    profile it would clear the server default profile's credential cache."""
+    import threading
+
+    import api.oauth as oauth
+    import api.profiles as profiles
+
+    _install_fake_agent_auth_lock(monkeypatch)
+    monkeypatch.setattr(oauth, "_get_active_profile_name", lambda: "work")
+    flow_id = _start_codex_flow_with_fake_device(monkeypatch, oauth, tmp_path)
+    seen = []
+    monkeypatch.setattr(oauth, "_invalidate_provider_state_caches",
+                        lambda provider: seen.append(profiles.get_active_profile_name()))
+    worker = threading.Thread(target=oauth._run_codex_oauth_worker, args=(flow_id,), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert oauth.poll_onboarding_oauth_flow(flow_id)["status"] == "success"
+    assert seen == ["work"]

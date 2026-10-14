@@ -9,6 +9,7 @@ tokens stay server-side and are persisted to the active Hermes profile's
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -63,10 +64,21 @@ _OAUTH_FLOWS_LOCK = threading.Lock()
 _OAUTH_START_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _OAUTH_START_LOCKS_LOCK = threading.Lock()
 _ANTHROPIC_ENV_KEYS = ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY")
-# The Agent's Codex refresh holds the auth lock for up to its refresh timeout
-# (20 s) + 5 s and waits that long itself; the 15 s default would fail a login
-# that finishes during a slow refresh.
-_AGENT_AUTH_LOCK_TIMEOUT_SECONDS = 25.0
+
+
+def _agent_auth_lock_timeout_seconds() -> float:
+    """How long to wait for the Agent auth lock.
+
+    The Agent's Codex refresh holds that lock for up to its refresh timeout
+    (``HERMES_CODEX_REFRESH_TIMEOUT_SECONDS``, 20 s by default) + 5 s and waits
+    that long itself; the lock's 15 s default would fail a login that finishes
+    during a slow refresh. Same rule as the Agent.
+    """
+    try:
+        refresh_timeout = float(os.environ.get("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS") or 20.0)
+    except ValueError:
+        refresh_timeout = 20.0
+    return max(15.0, refresh_timeout + 5.0)
 
 
 def _oauth_start_key(provider: str, hermes_home: Path) -> tuple[str, str]:
@@ -103,9 +115,10 @@ def _pending_oauth_flow_for_locked(provider: str, hermes_home: Path) -> tuple[st
             continue
         if str(flow.get("hermes_home") or "") != canonical_home:
             continue
-        if flow.get("status") != "pending":
+        # A committed flow already used its code; a new start gets a new flow.
+        if not _flow_is_open(flow):
             continue
-        if _flow_is_open(flow) and float(flow.get("expires_at") or 0) <= now:
+        if float(flow.get("expires_at") or 0) <= now:
             flow["status"] = "expired"
             flow["updated_at"] = now
             _drop_sensitive_flow_fields(flow)
@@ -149,6 +162,41 @@ def _normalize_onboarding_oauth_provider(provider: str) -> str:
     if provider in _ANTHROPIC_PROVIDER_ALIASES:
         return "anthropic"
     return provider or "openai-codex"
+
+
+def _get_active_profile_name() -> str | None:
+    """Return the active profile name for this request, or None if unknown."""
+    try:
+        from api.profiles import get_active_profile_name
+
+        return get_active_profile_name()
+    except Exception:
+        logger.debug("Could not resolve the active profile name", exc_info=True)
+        return None
+
+
+@contextlib.contextmanager
+def _worker_profile_scope(profile: str | None):
+    """Bind ``profile`` to this worker thread's request-profile slot.
+
+    Profile-keyed caches (the credential-pool cache) resolve the profile from
+    the request thread-local; the OAuth worker thread has none and would clear
+    the server default profile's entry instead of the flow's. Only used on the
+    worker's own thread, which starts without a request profile.
+    """
+    if not profile:
+        yield
+        return
+    try:
+        from api.profiles import clear_request_profile, set_request_profile
+    except ImportError:
+        yield
+        return
+    set_request_profile(profile)
+    try:
+        yield
+    finally:
+        clear_request_profile()
 
 
 def _get_active_hermes_home() -> Path:
@@ -243,27 +291,50 @@ def _invalidate_provider_state_caches(provider: str) -> None:
         logger.debug("Failed to invalidate providers cache after %s credential change", provider, exc_info=True)
 
 
+@contextlib.contextmanager
 def _agent_auth_store_lock(auth_path: Path):
-    """Return the Agent's cross-process auth.json lock for ``auth_path``.
+    """Hold the Agent's cross-process auth.json lock for ``auth_path``.
 
     The Agent refreshes Codex tokens under ``_auth_store_lock``; a WebUI
     read-modify-write outside it can replace a refresh committed in between,
-    and refresh tokens are single-use. Without an importable Agent (or one
-    that predates the lock) persistence proceeds unlocked, as before.
+    and refresh tokens are single-use. Without an importable Agent, or one
+    whose lock cannot target a profile's auth.json (``target_path``, added
+    after the lock itself), persistence proceeds unlocked, as before.
     """
     try:
         from hermes_cli.auth import _auth_store_lock
     except ImportError as exc:
+        reason = str(exc)
+    else:
+        reason = ""
+        try:
+            params = inspect.signature(_auth_store_lock).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if not {"timeout_seconds", "target_path"} <= set(params):
+            reason = "this Agent's _auth_store_lock has no timeout_seconds/target_path"
+    if reason:
         logger.warning(
             "Agent auth store lock unavailable (%s); persisting Codex credentials "
             "to %s without it",
-            exc,
+            reason,
             auth_path,
         )
-        return contextlib.nullcontext()
-    return _auth_store_lock(
-        timeout_seconds=_AGENT_AUTH_LOCK_TIMEOUT_SECONDS, target_path=auth_path
-    )
+        yield
+        return
+
+    lock = _auth_store_lock(timeout_seconds=_agent_auth_lock_timeout_seconds(), target_path=auth_path)
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(lock)
+        except TimeoutError as exc:
+            # The Agent's message names the lock path and the holder's pid;
+            # keep those in the log, not in the browser.
+            logger.warning("Codex credentials not saved: %s", exc)
+            raise RuntimeError(
+                "Another Hermes process is updating the saved credentials. Start the login again."
+            ) from exc
+        yield
 
 
 def _is_webui_codex_entry(entry: Any) -> bool:
@@ -289,11 +360,12 @@ def _persist_codex_credentials(
     With ``flow_id``, the write happens only if that flow is still open, and in
     the same step the flow is marked committed so a later cancel or expiry
     cannot move it; returns None when a cancel or expiry got there first. The
-    flow becomes ``success`` only after the provider caches are cleared, so the
-    browser's refresh never reads a stale "no credential". Lock order: the
-    Agent auth lock first (it can wait up to 25 s), ``_OAUTH_FLOWS_LOCK``
-    second, so cancel and poll are not blocked during that wait; no lock is
-    held while clearing the caches, which can wait behind a model rebuild.
+    flow becomes ``success`` only after the provider caches are cleared (for
+    the flow's profile), so the refresh the browser starts on success reads the
+    new credential. Lock order: the Agent auth lock first (it can wait up to
+    25 s), ``_OAUTH_FLOWS_LOCK`` second, so cancel and poll are not blocked
+    during that wait; no lock is held while clearing the caches, which can wait
+    behind a model rebuild.
     """
     access_token = str(token_data.get("access_token") or "").strip()
     refresh_token = str(token_data.get("refresh_token") or "").strip()
@@ -301,6 +373,7 @@ def _persist_codex_credentials(
         raise RuntimeError("Codex token exchange did not return an access_token")
 
     auth_path = Path(hermes_home) / "auth.json"
+    profile = None
     with _agent_auth_store_lock(auth_path), (
         _OAUTH_FLOWS_LOCK if flow_id else contextlib.nullcontext()
     ):
@@ -354,9 +427,11 @@ def _persist_codex_credentials(
             flow["_committed"] = True
             flow["updated_at"] = time.time()
             _drop_sensitive_flow_fields(flow)
+            profile = flow.get("profile")
 
     try:
-        _invalidate_provider_state_caches("openai-codex")
+        with _worker_profile_scope(profile):
+            _invalidate_provider_state_caches("openai-codex")
     finally:
         if flow_id:
             # The credential is saved; a committed flow can only end in success.
@@ -895,6 +970,7 @@ def start_onboarding_oauth_flow(body: dict[str, Any] | None) -> dict[str, Any]:
             "expires_at": expires_at,
             "poll_interval_seconds": interval,
             "hermes_home": str(hermes_home),
+            "profile": _get_active_profile_name(),
             "created_at": time.time(),
             "updated_at": time.time(),
         }

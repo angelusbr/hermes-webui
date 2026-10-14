@@ -181,22 +181,26 @@ def _worker_profile_scope(profile: str | None):
 
     Profile-keyed caches (the credential-pool cache) resolve the profile from
     the request thread-local; the OAuth worker thread has none and would clear
-    the server default profile's entry instead of the flow's. Only used on the
-    worker's own thread, which starts without a request profile.
+    the server default profile's entry instead of the flow's. Restores the
+    thread's previous profile on exit, like ``profile_scope_for_detached_worker``.
     """
     if not profile:
         yield
         return
     try:
-        from api.profiles import clear_request_profile, set_request_profile
+        from api import profiles
     except ImportError:
         yield
         return
-    set_request_profile(profile)
+    previous = getattr(profiles._tls, "profile", None)
+    profiles.set_request_profile(profile)
     try:
         yield
     finally:
-        clear_request_profile()
+        if previous is None:
+            profiles.clear_request_profile()
+        else:
+            profiles.set_request_profile(previous)
 
 
 def _get_active_hermes_home() -> Path:

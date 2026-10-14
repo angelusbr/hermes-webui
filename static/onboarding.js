@@ -611,6 +611,9 @@ let _codexOAuthUi=null;
 // Bumped on every start: a response that arrives after a newer start (another
 // profile, another surface) belongs to an abandoned flow and must not touch it.
 let _codexOAuthStartSeq=0;
+// Bumped by cancel: a poll already in flight when Cancel is clicked must not
+// start a second poll loop next to the one the cancel response resumes.
+let _codexOAuthPollGen=0;
 
 function _codexOAuthWizardUi(){
   return {
@@ -648,13 +651,23 @@ async function cancelCodexOAuth(){
   const flowDiv=_codexOAuthCurrentUi().flow();
   const flowId=_codexOAuthFlowId;
   const seq=_codexOAuthStartSeq;
+  if(!flowId)return;
   _clearCodexOAuthPoll();
+  _codexOAuthPollGen++;
   _codexOAuthFlowId=null;
-  if(flowId){
-    try{await api('/api/onboarding/oauth/cancel',{method:'POST',body:JSON.stringify({flow_id:flowId})});}catch(e){}
-  }
+  let status=null;
+  try{
+    const resp=await api('/api/onboarding/oauth/cancel',{method:'POST',body:JSON.stringify({flow_id:flowId})});
+    status=resp&&resp.status;
+  }catch(e){}
   // A newer start owns the button and surface now; leave them alone.
   if(seq!==_codexOAuthStartSeq)return;
+  if(status!=='cancelled'){
+    // The server did not cancel it: the credential may already be saved, or
+    // the request failed. Keep following the flow and show what it ends as.
+    _codexOAuthFlowId=flowId;
+    return _pollCodexOAuth(seq);
+  }
   _setCodexOAuthButton(true);
   if(flowDiv){
     flowDiv.innerHTML=`<div class="onboarding-oauth-card"><div class="onboarding-oauth-icon">⏹</div><div><strong>OAuth login cancelled</strong><p style="margin-top:6px;color:var(--muted);font-size:13px">Start again whenever you're ready.</p></div></div>`;
@@ -677,9 +690,10 @@ function _renderCodexOAuthTerminal(status,message){
 async function _pollCodexOAuth(seq){
   const flowId=_codexOAuthFlowId;
   if(!flowId)return;
+  const gen=_codexOAuthPollGen;
   // A restart in the same profile gets the same pending flow_id back, so the
   // flow id alone cannot tell this poll from the newer start's.
-  const stale=()=>seq!==_codexOAuthStartSeq||_codexOAuthFlowId!==flowId;
+  const stale=()=>seq!==_codexOAuthStartSeq||_codexOAuthFlowId!==flowId||gen!==_codexOAuthPollGen;
   try{
     const resp=await api('/api/onboarding/oauth/poll?flow_id='+encodeURIComponent(flowId));
     if(stale())return;
@@ -725,7 +739,12 @@ async function startCodexOAuth(ui){
   flowDiv.style.display='block';
   flowDiv.innerHTML=`<div class="onboarding-oauth-card onboarding-oauth-pending"><div class="onboarding-oauth-icon">⏳</div><div><strong>${t('oauth_codex_polling')}</strong><p>Starting device-code flow…</p></div></div>`;
   try{
-    const resp=await api('/api/onboarding/oauth/start',{method:'POST',body:JSON.stringify({provider:'openai-codex'})});
+    // The profile cookie is shared by all tabs; send the profile this page
+    // shows so the server refuses the start if another tab switched it.
+    const shownProfile=(typeof S!=='undefined'&&S&&typeof S.activeProfile==='string'&&S.activeProfile.trim())||'';
+    const startBody={provider:'openai-codex'};
+    if(shownProfile)startBody.profile=shownProfile;
+    const resp=await api('/api/onboarding/oauth/start',{method:'POST',body:JSON.stringify(startBody)});
     if(seq!==_codexOAuthStartSeq)return;
     if(resp.error) throw new Error(resp.error);
     const{flow_id,user_code,verification_uri}=resp;

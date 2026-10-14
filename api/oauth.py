@@ -105,7 +105,7 @@ def _pending_oauth_flow_for_locked(provider: str, hermes_home: Path) -> tuple[st
             continue
         if flow.get("status") != "pending":
             continue
-        if float(flow.get("expires_at") or 0) <= now:
+        if _flow_is_open(flow) and float(flow.get("expires_at") or 0) <= now:
             flow["status"] = "expired"
             flow["updated_at"] = now
             _drop_sensitive_flow_fields(flow)
@@ -286,11 +286,14 @@ def _persist_codex_credentials(
 ) -> Path | None:
     """Persist Codex OAuth credentials to active-profile auth.json.
 
-    With ``flow_id``, the write happens only if that flow is still pending, and
-    the flow is marked ``success`` in the same step; returns None when a cancel
-    or expiry got there first. Lock order: the Agent auth lock first (it can
-    wait up to 25 s), ``_OAUTH_FLOWS_LOCK`` second, so cancel and poll are not
-    blocked during that wait and an accepted cancel is never overwritten.
+    With ``flow_id``, the write happens only if that flow is still open, and in
+    the same step the flow is marked committed so a later cancel or expiry
+    cannot move it; returns None when a cancel or expiry got there first. The
+    flow becomes ``success`` only after the provider caches are cleared, so the
+    browser's refresh never reads a stale "no credential". Lock order: the
+    Agent auth lock first (it can wait up to 25 s), ``_OAUTH_FLOWS_LOCK``
+    second, so cancel and poll are not blocked during that wait; no lock is
+    held while clearing the caches, which can wait behind a model rebuild.
     """
     access_token = str(token_data.get("access_token") or "").strip()
     refresh_token = str(token_data.get("refresh_token") or "").strip()
@@ -303,7 +306,7 @@ def _persist_codex_credentials(
     ):
         if flow_id:
             flow = _OAUTH_FLOWS.get(flow_id)
-            if not flow or flow.get("status") != "pending":
+            if not _flow_is_open(flow):
                 return None
         auth = _read_auth_json(auth_path)
         auth.setdefault("version", 1)
@@ -348,11 +351,16 @@ def _persist_codex_credentials(
         path = _write_auth_json(auth, auth_path)
         if flow_id:
             # Inline: _set_flow_status would take _OAUTH_FLOWS_LOCK again.
-            flow["status"] = "success"
+            flow["_committed"] = True
             flow["updated_at"] = time.time()
             _drop_sensitive_flow_fields(flow)
 
-    _invalidate_provider_state_caches("openai-codex")
+    try:
+        _invalidate_provider_state_caches("openai-codex")
+    finally:
+        if flow_id:
+            # The credential is saved; a committed flow can only end in success.
+            _set_flow_status(flow_id, "success")
 
     return path
 
@@ -700,6 +708,16 @@ def _drop_sensitive_flow_fields(flow: dict[str, Any]) -> None:
         flow.pop(key, None)
 
 
+def _flow_is_open(flow: dict[str, Any] | None) -> bool:
+    """True while a flow can still be cancelled, expired or failed.
+
+    A Codex flow whose credential is already written stays ``pending`` until
+    the provider caches are cleared, then becomes ``success``; in that window
+    it is decided and nothing may move it elsewhere.
+    """
+    return bool(flow) and flow.get("status") == "pending" and not flow.get("_committed")
+
+
 def _cleanup_oauth_flows(now: float | None = None) -> None:
     """Expire pending flows past their deadline and purge terminal flows older than 300 seconds from memory."""
     now = now or time.time()
@@ -707,7 +725,7 @@ def _cleanup_oauth_flows(now: float | None = None) -> None:
     with _OAUTH_FLOWS_LOCK:
         for fid, flow in list(_OAUTH_FLOWS.items()):
             status = flow.get("status")
-            if status == "pending" and float(flow.get("expires_at") or 0) <= now:
+            if _flow_is_open(flow) and float(flow.get("expires_at") or 0) <= now:
                 flow["status"] = "expired"
                 _drop_sensitive_flow_fields(flow)
             if status in {"success", "expired", "cancelled", "error"} and float(flow.get("updated_at") or 0) < cutoff:
@@ -774,7 +792,7 @@ def _run_codex_oauth_worker(flow_id: str) -> None:
             logger.warning("Codex OAuth onboarding flow failed: %s", exc)
             with _OAUTH_FLOWS_LOCK:
                 current = _OAUTH_FLOWS.get(flow_id)
-                if current and current.get("status") == "pending":
+                if _flow_is_open(current):
                     current["status"] = "error"
                     current["updated_at"] = time.time()
                     current["error"] = str(exc)
@@ -901,7 +919,7 @@ def poll_onboarding_oauth_flow(flow_id: str) -> dict[str, Any]:
         flow = _OAUTH_FLOWS.get(fid)
         if not flow:
             raise KeyError("OAuth flow not found")
-        if flow.get("status") == "pending" and float(flow.get("expires_at") or 0) <= time.time():
+        if _flow_is_open(flow) and float(flow.get("expires_at") or 0) <= time.time():
             flow["status"] = "expired"
             flow["updated_at"] = time.time()
             _drop_sensitive_flow_fields(flow)
@@ -920,7 +938,7 @@ def cancel_onboarding_oauth_flow(body: dict[str, Any] | None) -> dict[str, Any]:
         flow = _OAUTH_FLOWS.get(fid)
         if not flow:
             return {"ok": True, "provider": requested_provider, "flow_id": fid, "status": "cancelled"}
-        if flow.get("status") == "pending":
+        if _flow_is_open(flow):
             flow["status"] = "cancelled"
             flow["updated_at"] = time.time()
             _drop_sensitive_flow_fields(flow)
